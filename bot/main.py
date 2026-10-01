@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 from .checker import Checker
 from .config import DATA_DIR, TZ, load_config
 from .db import Database, Defaults
-from .handlers import BOT_COMMANDS, router
+from .handlers import BOT_COMMANDS, BOT_DESCRIPTION, BOT_SHORT_DESCRIPTION, router
 from .travelpayouts import TravelpayoutsClient
 
 
@@ -29,6 +29,8 @@ async def main() -> None:
     await db.connect()
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands(BOT_COMMANDS)
+    await bot.set_my_description(BOT_DESCRIPTION)
+    await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
 
     async with TravelpayoutsClient(config.tp_token, config.tp_marker, DATA_DIR) as tp:
         checker = Checker(config, db, tp, bot)
