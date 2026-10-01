@@ -5,8 +5,10 @@
 поэтому они могут немного отставать от реальных.
 """
 
+import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -15,6 +17,13 @@ from urllib.parse import urlencode
 import aiohttp
 
 API_URL = "https://api.travelpayouts.com"
+
+# Лимит API — 600 запросов в минуту отдельно на каждый метод. Держимся ниже: 9 в секунду (540 в минуту) на метод.
+REQUESTS_PER_SECOND = 9
+RETRIES = 3
+# Цены в API — кэш поисков за ~48 часов и меняются нечасто, поэтому одинаковые запросы
+# от фоновой проверки и от пользователей 10 минут берём из памяти
+RESPONSE_TTL = 10 * 60
 AVIASALES_URL = "https://www.aviasales.ru"
 
 # Разговорные названия, которых нет в справочнике
@@ -26,6 +35,29 @@ CITY_ALIASES = {
 }
 
 log = logging.getLogger(__name__)
+
+
+class RateLimitError(Exception):
+    def __init__(self, retry_after: float):
+        super().__init__(f"Travelpayouts: превышен лимит запросов, ждать {retry_after} с")
+        self.retry_after = retry_after
+
+
+class RateLimiter:
+    """Равномерно распределяет запросы: не больше rate в секунду."""
+
+    def __init__(self, rate: float):
+        self._interval = 1 / rate
+        self._next = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            delay = self._next - now
+            self._next = max(now, self._next) + self._interval
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 @dataclass(frozen=True)
@@ -55,6 +87,9 @@ class TravelpayoutsClient:
         self._cities: dict[str, str] = {}
         self._city_codes: dict[str, str] = {}
         self._airlines: dict[str, str] = {}
+        self._limiters: dict[str, RateLimiter] = {}  # свой на каждый метод API
+        self._cache: dict[tuple, tuple[float, object]] = {}  # запрос -> (когда устареет, ответ)
+        self._inflight: dict[tuple, asyncio.Future] = {}  # запросы, которые выполняются прямо сейчас
 
     async def __aenter__(self) -> "TravelpayoutsClient":
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -81,17 +116,23 @@ class TravelpayoutsClient:
         code = query.strip().upper()
         return code if code in self._cities else None
 
-    async def cheapest(self, origin: str, day: date, destination: str | None = None) -> list[Ticket]:
-        """Самые дешёвые билеты в одну сторону на дату day: в destination или во все направления."""
+    async def cheapest(self, origin: str, when: str, destination: str | None = None) -> list[Ticket]:
+        """Самые дешёвые билеты в одну сторону в destination или во все направления.
+
+        when — день («2026-10-01») или целый месяц («2026-12»).
+        """
         params = {
             "origin": origin,
-            "departure_at": day.isoformat(),
+            "departure_at": when,
             "one_way": "true",
             "sorting": "price",
             "limit": 1000,
         }
         if destination:
             params["destination"] = destination
+        else:
+            # Без unique API отдаёт один самый дешёвый билет, а с ним — по одному в каждое направление
+            params["unique"] = "true"
         data = await self._get("/aviasales/v3/prices_for_dates", params)
         return [self._parse_ticket(item) for item in data]
 
@@ -107,10 +148,51 @@ class TravelpayoutsClient:
         return {date.fromisoformat(day): int(item["price"]) for day, item in (data or {}).items()}
 
     async def _get(self, path: str, params: dict):
+        """Запрос к API через кэш. Одинаковые одновременные запросы склеиваются в один."""
+        key = (path, *sorted(params.items()))
+        now = time.monotonic()
+        cached = self._cache.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+        if key in self._inflight:
+            return await asyncio.shield(self._inflight[key])
+
+        task = asyncio.ensure_future(self._get_with_retries(path, params))
+        self._inflight[key] = task
+        try:
+            data = await asyncio.shield(task)
+        finally:
+            self._inflight.pop(key, None)
+        if len(self._cache) > 5000:
+            self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
+        self._cache[key] = (time.monotonic() + RESPONSE_TTL, data)
+        return data
+
+    async def _get_with_retries(self, path: str, params: dict):
+        for attempt in range(1, RETRIES + 1):
+            await self._limiters.setdefault(path, RateLimiter(REQUESTS_PER_SECOND)).wait()
+            try:
+                return await self._request(path, params)
+            except RateLimitError as e:
+                if attempt == RETRIES:
+                    raise
+                log.warning("%s, попытка %d", e, attempt)
+                await asyncio.sleep(e.retry_after)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt == RETRIES:
+                    raise
+                log.warning("Travelpayouts не ответил (%s), попытка %d", e or type(e).__name__, attempt)
+                await asyncio.sleep(2 * attempt)
+
+    async def _request(self, path: str, params: dict):
         params = {**params, "currency": "rub", "token": self._token}
         async with self._session.get(API_URL + path, params=params) as resp:
             if resp.status == 401:
                 raise RuntimeError("Travelpayouts: неверный TRAVELPAYOUTS_TOKEN")
+            if resp.status == 429:
+                raise RateLimitError(float(resp.headers.get("X-Rate-Limit-Reset") or 10))
+            if resp.status >= 500:
+                raise aiohttp.ClientResponseError(resp.request_info, (), status=resp.status, message="ошибка сервера")
             if resp.status != 200:
                 raise RuntimeError(f"Travelpayouts вернул {resp.status}: {(await resp.text())[:200]}")
             body = await resp.json(content_type=None)

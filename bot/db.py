@@ -1,9 +1,11 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 import aiosqlite
+
+from .config import today
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscribers (
@@ -12,11 +14,14 @@ CREATE TABLE IF NOT EXISTS subscribers (
 );
 
 -- Настройки пользователя. Создаются при первом обращении из значений по умолчанию (.env).
+-- date_from/date_to — свой период поездки (ISO-даты). Если задан, days_ahead не используется.
 CREATE TABLE IF NOT EXISTS user_settings (
     chat_id INTEGER PRIMARY KEY,
     min_discount INTEGER NOT NULL,
     max_price INTEGER NOT NULL,
-    days_ahead INTEGER NOT NULL
+    days_ahead INTEGER NOT NULL,
+    date_from TEXT,
+    date_to TEXT
 );
 
 -- Города вылета пользователя. Хотя бы один есть всегда.
@@ -42,18 +47,24 @@ CREATE TABLE IF NOT EXISTS sent_notifications (
     PRIMARY KEY (chat_id, key)
 );
 
--- «Обычная» цена маршрута. price = NULL — данных по маршруту не хватило.
-CREATE TABLE IF NOT EXISTS route_baselines (
+-- «Обычная» цена маршрута за период. price = NULL — данных по маршруту не хватило.
+-- period — «ближайшие дни» ('') или свой период пользователя ('2026-12-21:2027-01-15').
+CREATE TABLE IF NOT EXISTS baselines (
     origin TEXT NOT NULL,
     destination TEXT NOT NULL,
+    period TEXT NOT NULL,
     price INTEGER,
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (origin, destination)
+    PRIMARY KEY (origin, destination, period)
 );
 
--- Таблица из первого этапа, заменена на sent_notifications
+-- Старые таблицы: sent_offers заменена на sent_notifications, route_baselines — на baselines
 DROP TABLE IF EXISTS sent_offers;
+DROP TABLE IF EXISTS route_baselines;
 """
+
+# Колонки, добавленные после первого запуска: в старых базах их создаёт миграция в connect()
+MIGRATIONS = {"user_settings": {"date_from": "TEXT", "date_to": "TEXT"}}
 
 CityKind = Literal["from", "to"]
 CITY_TABLES = {"from": "user_origins", "to": "user_destinations"}
@@ -68,6 +79,12 @@ class UserSettings:
     min_discount: int
     max_price: int  # 0 — без потолка
     days_ahead: int
+    date_from: date | None = None  # свой период поездки; если задан, days_ahead не используется
+    date_to: date | None = None
+
+    @property
+    def has_range(self) -> bool:
+        return self.date_from is not None and self.date_to is not None
 
 
 @dataclass(frozen=True)
@@ -88,6 +105,12 @@ class Database:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self._path)
         await self._conn.executescript(SCHEMA)
+        for table, columns in MIGRATIONS.items():
+            async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
+                existing = {row[1] async for row in cur}
+            for name, kind in columns.items():
+                if name not in existing:
+                    await self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -113,9 +136,14 @@ class Database:
     async def settings(self, chat_id: int) -> UserSettings:
         await self._ensure_settings(chat_id)
         async with self._conn.execute(
-            "SELECT min_discount, max_price, days_ahead FROM user_settings WHERE chat_id = ?", (chat_id,)
+            "SELECT min_discount, max_price, days_ahead, date_from, date_to FROM user_settings WHERE chat_id = ?",
+            (chat_id,),
         ) as cur:
-            min_discount, max_price, days_ahead = await cur.fetchone()
+            min_discount, max_price, days_ahead, date_from, date_to = await cur.fetchone()
+        if date_to and date.fromisoformat(date_to) < today():
+            # Период прошёл — возвращаемся к ближайшим дням
+            await self.set_date_range(chat_id, None, None)
+            date_from = date_to = None
         return UserSettings(
             chat_id=chat_id,
             origins=await self.cities(chat_id, "from"),
@@ -123,7 +151,18 @@ class Database:
             min_discount=min_discount,
             max_price=max_price,
             days_ahead=days_ahead,
+            date_from=date.fromisoformat(date_from) if date_from else None,
+            date_to=date.fromisoformat(date_to) if date_to else None,
         )
+
+    async def set_date_range(self, chat_id: int, date_from: date | None, date_to: date | None) -> None:
+        """Свой период поездки. None, None — снова искать на ближайшие дни (days_ahead)."""
+        await self._ensure_settings(chat_id)
+        await self._conn.execute(
+            "UPDATE user_settings SET date_from = ?, date_to = ? WHERE chat_id = ?",
+            (date_from and date_from.isoformat(), date_to and date_to.isoformat(), chat_id),
+        )
+        await self._conn.commit()
 
     async def update_setting(self, chat_id: int, field: str, value: int) -> None:
         if field not in SETTING_FIELDS:
@@ -167,13 +206,14 @@ class Database:
 
     # --- отправленные уведомления ---
 
-    async def is_new_or_cheaper(self, chat_id: int, key: str, price: int) -> bool:
-        """True, если билет ещё не присылали этому пользователю или он подешевел с прошлого раза."""
+    async def is_new_or_cheaper(self, chat_id: int, key: str, price: int, min_drop_percent: int) -> bool:
+        """True, если билет ещё не присылали этому пользователю
+        или он подешевел с прошлого раза хотя бы на min_drop_percent процентов."""
         async with self._conn.execute(
             "SELECT price FROM sent_notifications WHERE chat_id = ? AND key = ?", (chat_id, key)
         ) as cur:
             row = await cur.fetchone()
-        return row is None or price < row[0]
+        return row is None or price <= row[0] * (1 - min_drop_percent / 100)
 
     async def mark_sent(self, chat_id: int, key: str, price: int) -> None:
         await self._conn.execute(
@@ -185,21 +225,28 @@ class Database:
 
     # --- обычные цены маршрутов ---
 
-    async def get_baseline(self, origin: str, destination: str, max_age: timedelta) -> tuple[bool, int | None]:
+    async def get_baseline(
+        self, origin: str, destination: str, period: str, max_age: timedelta
+    ) -> tuple[bool, int | None]:
         """(найдено ли свежее значение, цена). Цена может быть None — данных по маршруту нет."""
         async with self._conn.execute(
-            "SELECT price, updated_at FROM route_baselines WHERE origin = ? AND destination = ?",
-            (origin, destination),
+            "SELECT price, updated_at FROM baselines WHERE origin = ? AND destination = ? AND period = ?",
+            (origin, destination, period),
         ) as cur:
             row = await cur.fetchone()
         if row is None or datetime.fromisoformat(row[1]) < datetime.now() - max_age:
             return False, None
         return True, row[0]
 
-    async def save_baseline(self, origin: str, destination: str, price: int | None) -> None:
+    async def save_baseline(
+        self, origin: str, destination: str, period: str, price: int | None, max_age: timedelta
+    ) -> None:
+        now = datetime.now()
         await self._conn.execute(
-            "INSERT INTO route_baselines (origin, destination, price, updated_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(origin, destination) DO UPDATE SET price = excluded.price, updated_at = excluded.updated_at",
-            (origin, destination, price, datetime.now().isoformat()),
+            "INSERT INTO baselines (origin, destination, period, price, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(origin, destination, period) DO UPDATE SET price = excluded.price, updated_at = excluded.updated_at",
+            (origin, destination, period, price, now.isoformat()),
         )
+        # Устаревшие значения больше не нужны — периоды пользователей меняются
+        await self._conn.execute("DELETE FROM baselines WHERE updated_at < ?", ((now - max_age).isoformat(),))
         await self._conn.commit()
