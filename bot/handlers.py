@@ -68,7 +68,7 @@ async def cmd_start(message: Message, state: FSMContext, db: Database, checker: 
     user = await db.settings(message.chat.id)
     await message.answer(
         "✈️ Вы подписаны на горящие билеты!\n\n" + main_text(user, checker) + "\n\n/stop — отписаться",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(user),
     )
 
 
@@ -147,11 +147,11 @@ def main_text(user: UserSettings, checker: Checker) -> str:
     )
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
+def main_keyboard(user: UserSettings) -> InlineKeyboardMarkup:
     return _keyboard(
         [CHECK_BUTTON],
         [("🛫 Откуда", "cities:from"), ("🛬 Куда", "cities:to")],
-        [("⚙️ Настройки", "menu:settings")],
+        [(f"📅 {days_label(user.days_ahead)}", "menu:days"), ("⚙️ Настройки", "menu:settings")],
     )
 
 
@@ -159,7 +159,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
 async def cb_main(query: CallbackQuery, state: FSMContext, db: Database, checker: Checker) -> None:
     await state.clear()
     user = await db.settings(query.message.chat.id)
-    await _edit(query, main_text(user, checker), main_keyboard())
+    await _edit(query, main_text(user, checker), main_keyboard(user))
 
 
 @router.callback_query(F.data == "menu:new")
@@ -167,26 +167,24 @@ async def cb_main_new(query: CallbackQuery, state: FSMContext, db: Database, che
     """Главный экран новым сообщением, чтобы не затирать найденные билеты."""
     await state.clear()
     user = await db.settings(query.message.chat.id)
-    await query.message.answer(main_text(user, checker), reply_markup=main_keyboard())
+    await query.message.answer(main_text(user, checker), reply_markup=main_keyboard(user))
     await query.answer()
 
 
-# --- настройки: скидка, потолок цены, даты ---
+# --- настройки: скидка и потолок цены ---
 
 
 def settings_text(user: UserSettings) -> str:
     return (
         "⚙️ <b>Настройки</b>\n\n"
         f"📉 Скидка от обычной цены: <b>от {user.min_discount}%</b>\n"
-        f"💰 Потолок цены: <b>{price_label(user.max_price)}</b>\n"
-        f"📅 Даты: <b>{days_label(user.days_ahead).lower()}</b>"
+        f"💰 Потолок цены: <b>{price_label(user.max_price)}</b>"
     )
 
 
 def settings_keyboard(user: UserSettings) -> InlineKeyboardMarkup:
     return _keyboard(
         [(f"📉 Скидка: {user.min_discount}%", "menu:discount"), (f"💰 {price_label(user.max_price)}", "menu:price")],
-        [(f"📅 {days_label(user.days_ahead)}", "menu:days")],
         BACK_ROW,
     )
 
@@ -236,17 +234,21 @@ async def cb_days_menu(query: CallbackQuery, state: FSMContext, db: Database) ->
     await _edit(
         query,
         "📅 На какие даты искать билеты?",
-        _keyboard(buttons[:2], buttons[2:], SETTINGS_BACK_ROW),
+        _keyboard(buttons[:2], buttons[2:], BACK_ROW),
     )
 
 
 @router.callback_query(F.data.startswith("set:"))
-async def cb_set(query: CallbackQuery, state: FSMContext, db: Database) -> None:
+async def cb_set(query: CallbackQuery, state: FSMContext, db: Database, checker: Checker) -> None:
     await state.clear()
     _, field, value = query.data.split(":")
     await db.update_setting(query.message.chat.id, field, int(value))
     await query.answer("Сохранено ✅")
-    await _show_settings(query, db)
+    if field == "days_ahead":  # даты выбираются с главного экрана
+        user = await db.settings(query.message.chat.id)
+        await _edit(query, main_text(user, checker), main_keyboard(user))
+    else:
+        await _show_settings(query, db)
 
 
 @router.callback_query(F.data == "input:max_price")
