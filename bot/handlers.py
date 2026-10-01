@@ -12,7 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from .checker import MAX_DEALS_PER_MESSAGE, Checker, format_deals, rub
+from .checker import MAX_DEALS_PER_MESSAGE, Checker, format_deals, rub, trip_label
 from .config import today
 from .db import CityKind, Database, UserSettings
 
@@ -34,7 +34,7 @@ BOT_DESCRIPTION = (
     "🔥 Ищу горящие авиабилеты: сильно дешевле обычной цены, с вылетом сегодня и завтра.\n\n"
     "✈️ Выберите города вылета и направления\n"
     "💸 Задайте скидку и потолок цены\n"
-    "📆 Или следите за своими датами — например, домой на новогодние каникулы\n"
+    "📆 И заодно следите за своей поездкой — например, домой на новогодние каникулы\n"
     "🔔 Получайте уведомление, как только появится выгодный билет\n\n"
     "Нажмите «Старт», чтобы подписаться.\n\n"
     "Автор: @luvv_life"
@@ -43,6 +43,7 @@ BOT_DESCRIPTION = (
 DISCOUNT_OPTIONS = [20, 30, 40, 50, 60, 70]
 PRICE_OPTIONS = [2000, 3000, 3500, 5000, 7000, 10000]
 DAYS_OPTIONS = {0: "Только сегодня", 1: "Сегодня и завтра", 2: "3 дня", 6: "Неделя"}
+DAYS_OFF = -1  # ближайшие дни не отслеживать (например, нужна только поездка)
 MAX_RANGE_DAYS = 62  # свой период — не длиннее двух месяцев
 
 CITY_TEXT = {
@@ -72,7 +73,7 @@ async def cmd_start(message: Message, state: FSMContext, db: Database, checker: 
     await db.add_subscriber(message.chat.id)
     user = await db.settings(message.chat.id)
     await message.answer(
-        "✈️ Вы подписаны на горящие билеты!\n\n" + main_text(user, checker) + "\n\n/stop — отписаться",
+        "✈️ Вы подписаны на горящие билеты!\n\n" + main_text(user, checker),
         reply_markup=main_keyboard(user),
     )
 
@@ -81,7 +82,23 @@ async def cmd_start(message: Message, state: FSMContext, db: Database, checker: 
 async def cmd_stop(message: Message, state: FSMContext, db: Database) -> None:
     await state.clear()
     await db.remove_subscriber(message.chat.id)
-    await message.answer("Вы отписались. Настройки сохранены — вернуться можно командой /start")
+    await message.answer(
+        "🔕 Уведомления выключены. Настройки сохранены, проверять билеты вручную по-прежнему можно.",
+        reply_markup=_keyboard([("🔔 Включить уведомления", "notify:on")], [CHECK_BUTTON]),
+    )
+
+
+@router.callback_query(F.data.startswith("notify:"))
+async def cb_notify(query: CallbackQuery, state: FSMContext, db: Database, checker: Checker) -> None:
+    await state.clear()
+    if query.data == "notify:on":
+        await db.add_subscriber(query.message.chat.id)
+        await query.answer("🔔 Уведомления включены")
+    else:
+        await db.remove_subscriber(query.message.chat.id)
+        await query.answer("🔕 Уведомления выключены. Проверять билеты вручную можно по-прежнему")
+    user = await db.settings(query.message.chat.id)
+    await _edit(query, main_text(user, checker), main_keyboard(user))
 
 
 @router.message(Command("settings"))
@@ -123,13 +140,15 @@ async def run_check(message: Message, db: Database, checker: Checker) -> None:
         text = f"⚠️ Не удалось получить цены: {escape(str(e))}"
     else:
         if deals:
-            text = format_deals(deals[:MAX_DEALS_PER_MESSAGE], checker.tp)
+            text = format_deals(deals[:MAX_DEALS_PER_MESSAGE], checker.tp, trip_label=trip_label(user))
             if len(deals) > MAX_DEALS_PER_MESSAGE:
                 text += f"\n\n…и ещё {len(deals) - MAX_DEALS_PER_MESSAGE}"
         elif cheapest:
             text = "Горящих билетов сейчас нет. Самые дешёвые по вашим направлениям:\n\n" + format_deals(
-                cheapest[:MAX_DEALS_PER_MESSAGE], checker.tp, hot=False
+                cheapest[:MAX_DEALS_PER_MESSAGE], checker.tp, hot=False, trip_label=trip_label(user)
             )
+        elif not tracking(user):
+            text = "Бот сейчас ничего не ищет: включите ближайшие дни или добавьте поездку на главном экране."
         else:
             text = "Сейчас горящих билетов нет 🤷\n\nМожно снизить скидку или поднять потолок цены в настройках."
 
@@ -147,8 +166,16 @@ def main_text(user: UserSettings, checker: Checker) -> str:
         f"🛫 Откуда: <b>{escape(origins)}</b>\n"
         f"🛬 Куда: <b>{escape(dests)}</b>\n"
         f"📉 Скидка от обычной цены: <b>от {user.min_discount}%</b>\n"
-        f"💰 Потолок цены: <b>{price_label(user.max_price)}</b>\n"
-        f"📅 Даты: <b>{dates_label(user).lower()}</b>"
+        f"💰 Потолок цены: <b>{price_label(user.max_price)}</b>\n\n"
+        "<b>Слежу за билетами:</b>\n"
+        f"📅 Ближайшие дни: <b>{days_label(user.days_ahead).lower()}</b>\n"
+        f"📆 Поездка: <b>{trip_label(user) or 'не задана'}</b>"
+        + ("" if tracking(user) else "\n\n⚠️ Сейчас бот ничего не ищет: включите ближайшие дни или добавьте поездку.")
+        + (
+            "\n\n🔔 Уведомления <b>включены</b>: пришлю билет, как только найду."
+            if user.subscribed
+            else "\n\n🔕 Уведомления <b>выключены</b>: сам ничего не пришлю, но проверить билеты можно кнопкой."
+        )
     )
 
 
@@ -156,7 +183,14 @@ def main_keyboard(user: UserSettings) -> InlineKeyboardMarkup:
     return _keyboard(
         [CHECK_BUTTON],
         [("🛫 Откуда", "cities:from"), ("🛬 Куда", "cities:to")],
-        [(f"📅 {dates_label(user)}", "menu:days"), ("⚙️ Настройки", "menu:settings")],
+        [
+            ("📅 Ближайшие дни: выкл" if user.days_ahead == DAYS_OFF else f"📅 {days_label(user.days_ahead)}", "menu:days"),
+            (f"📆 Поездка {trip_label(user)}" if user.has_range else "📆 Добавить поездку", "menu:trip"),
+        ],
+        [
+            ("⚙️ Настройки", "menu:settings"),
+            ("🔕 Выключить уведомления", "notify:off") if user.subscribed else ("🔔 Включить уведомления", "notify:on"),
+        ],
     )
 
 
@@ -235,30 +269,56 @@ async def cb_price_menu(query: CallbackQuery, state: FSMContext, db: Database) -
 async def cb_days_menu(query: CallbackQuery, state: FSMContext, db: Database) -> None:
     await state.clear()
     user = await db.settings(query.message.chat.id)
-    buttons = [
-        (_mark(label, not user.has_range and d == user.days_ahead), f"set:days_ahead:{d}")
-        for d, label in DAYS_OPTIONS.items()
-    ]
-    custom = _mark(f"📆 {dates_label(user)}" if user.has_range else "📆 Свои даты", user.has_range)
+    buttons = [(_mark(label, d == user.days_ahead), f"set:days_ahead:{d}") for d, label in DAYS_OPTIONS.items()]
+    off = (_mark("🔕 Не следить", user.days_ahead == DAYS_OFF), f"set:days_ahead:{DAYS_OFF}")
+    trip = f"Поездка {trip_label(user)} отслеживается отдельно — она не меняется." if user.has_range else (
+        "Чтобы следить ещё и за конкретной поездкой, нажмите «📆 Добавить поездку» на главном экране."
+    )
     await _edit(
         query,
-        "📅 На какие даты искать билеты?\n\n"
-        "«Свои даты» — если ждёте билет на конкретную поездку, например домой на новогодние каникулы. "
-        "Бот будет следить за ценами на эти даты и пришлёт билет, когда он заметно подешевеет.",
-        _keyboard(buttons[:2], buttons[2:], [(custom, "input:dates")], BACK_ROW),
+        "📅 <b>Ближайшие дни</b>\n\n"
+        "Горящие билеты с вылетом в ближайшие дни — для спонтанных поездок.\n\n" + trip,
+        _keyboard(buttons[:2], buttons[2:], [off], BACK_ROW),
     )
 
 
-@router.callback_query(F.data == "input:dates")
-async def cb_input_dates(query: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "menu:trip")
+async def cb_trip_menu(query: CallbackQuery, state: FSMContext, db: Database) -> None:
+    """Экран поездки сразу ждёт ввода дат — как экраны городов."""
     await state.set_state(Input.date_range)
-    await query.answer()
-    await query.message.answer(
-        "📆 Напишите даты вылета, например:\n"
+    user = await db.settings(query.message.chat.id)
+    example = (
+        "Напишите даты вылета, например:\n"
         "<code>28.12-08.01</code> — с 28 декабря по 8 января\n"
-        "<code>30.12</code> — только 30 декабря",
-        reply_markup=_keyboard(BACK_ROW),
+        "<code>30.12</code> — только 30 декабря"
     )
+    if user.has_range:
+        text = (
+            f"📆 <b>Поездка: {trip_label(user)}</b>\n\n"
+            "Слежу за ценами на эти даты и пришлю билет, когда он станет заметно дешевле обычного для этих дат. "
+            "Ближайшие дни при этом тоже отслеживаются.\n\n"
+            f"✏️ Чтобы изменить даты, напишите новые. {example}"
+        )
+        rows = [[("🗑 Удалить поездку", "trip:delete")], BACK_ROW]
+    else:
+        text = (
+            "📆 <b>Поездка</b>\n\n"
+            "Ждёте билет на конкретные даты — например, домой на новогодние каникулы? "
+            "Бот будет следить за ценами на эти даты и пришлёт билет, когда он станет заметно дешевле обычного. "
+            "Ближайшие дни при этом тоже отслеживаются.\n\n"
+            f"✏️ {example}"
+        )
+        rows = [BACK_ROW]
+    await _edit(query, text, _keyboard(*rows))
+
+
+@router.callback_query(F.data == "trip:delete")
+async def cb_trip_delete(query: CallbackQuery, state: FSMContext, db: Database, checker: Checker) -> None:
+    await state.clear()
+    await db.set_date_range(query.message.chat.id, None, None)
+    await query.answer("Поездка удалена")
+    user = await db.settings(query.message.chat.id)
+    await _edit(query, main_text(user, checker), main_keyboard(user))
 
 
 @router.message(Input.date_range, F.text, ~F.text.startswith("/"))
@@ -271,7 +331,9 @@ async def input_dates(message: Message, state: FSMContext, db: Database, checker
     await state.clear()
     await db.set_date_range(message.chat.id, date_from, date_to)
     user = await db.settings(message.chat.id)
-    await message.answer("Сохранено ✅\n\n" + main_text(user, checker), reply_markup=main_keyboard(user))
+    await message.answer(
+        f"✅ Слежу за поездкой {trip_label(user)}\n\n" + main_text(user, checker), reply_markup=main_keyboard(user)
+    )
 
 
 def parse_date_range(text: str) -> tuple[date, date]:
@@ -312,8 +374,7 @@ async def cb_set(query: CallbackQuery, state: FSMContext, db: Database, checker:
     _, field, value = query.data.split(":")
     await db.update_setting(query.message.chat.id, field, int(value))
     await query.answer("Сохранено ✅")
-    if field == "days_ahead":  # даты выбираются с главного экрана
-        await db.set_date_range(query.message.chat.id, None, None)
+    if field == "days_ahead":  # ближайшие дни выбираются с главного экрана
         user = await db.settings(query.message.chat.id)
         await _edit(query, main_text(user, checker), main_keyboard(user))
     else:
@@ -464,9 +525,12 @@ def price_label(max_price: int) -> str:
     return rub(max_price) if max_price else "без потолка"
 
 
-def dates_label(user: UserSettings) -> str:
-    if user.has_range:
-        if user.date_from == user.date_to:
-            return f"{user.date_from:%d.%m}"
-        return f"{user.date_from:%d.%m}–{user.date_to:%d.%m}"
-    return DAYS_OPTIONS.get(user.days_ahead, f"{user.days_ahead + 1} дн.")
+def days_label(days_ahead: int) -> str:
+    if days_ahead == DAYS_OFF:
+        return "Выключено"
+    return DAYS_OPTIONS.get(days_ahead, f"{days_ahead + 1} дн.")
+
+
+def tracking(user: UserSettings) -> bool:
+    """Ищет ли бот хоть что-то: ближайшие дни или поездку."""
+    return user.days_ahead != DAYS_OFF or user.has_range

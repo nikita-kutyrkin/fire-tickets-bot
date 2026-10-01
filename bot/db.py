@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS subscribers (
 );
 
 -- Настройки пользователя. Создаются при первом обращении из значений по умолчанию (.env).
--- date_from/date_to — свой период поездки (ISO-даты). Если задан, days_ahead не используется.
+-- days_ahead — сколько ближайших дней отслеживать (-1 — не отслеживать),
+-- date_from/date_to — поездка (ISO-даты). Оба отслеживания работают одновременно.
 CREATE TABLE IF NOT EXISTS user_settings (
     chat_id INTEGER PRIMARY KEY,
     min_discount INTEGER NOT NULL,
@@ -78,9 +79,10 @@ class UserSettings:
     destinations: list[str]  # пусто — все направления
     min_discount: int
     max_price: int  # 0 — без потолка
-    days_ahead: int
-    date_from: date | None = None  # свой период поездки; если задан, days_ahead не используется
+    days_ahead: int  # ближайшие дни: 0 — сегодня, 1 — сегодня и завтра…; -1 — не отслеживать
+    date_from: date | None = None  # поездка; отслеживается одновременно с ближайшими днями
     date_to: date | None = None
+    subscribed: bool = False  # присылать ли уведомления (ручная проверка работает в любом случае)
 
     @property
     def has_range(self) -> bool:
@@ -127,6 +129,10 @@ class Database:
         await self._conn.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
         await self._conn.commit()
 
+    async def is_subscriber(self, chat_id: int) -> bool:
+        async with self._conn.execute("SELECT 1 FROM subscribers WHERE chat_id = ?", (chat_id,)) as cur:
+            return await cur.fetchone() is not None
+
     async def subscribers(self) -> list[int]:
         async with self._conn.execute("SELECT chat_id FROM subscribers") as cur:
             return [row[0] async for row in cur]
@@ -141,7 +147,7 @@ class Database:
         ) as cur:
             min_discount, max_price, days_ahead, date_from, date_to = await cur.fetchone()
         if date_to and date.fromisoformat(date_to) < today():
-            # Период прошёл — возвращаемся к ближайшим дням
+            # Поездка прошла — удаляем её
             await self.set_date_range(chat_id, None, None)
             date_from = date_to = None
         return UserSettings(
@@ -153,10 +159,11 @@ class Database:
             days_ahead=days_ahead,
             date_from=date.fromisoformat(date_from) if date_from else None,
             date_to=date.fromisoformat(date_to) if date_to else None,
+            subscribed=await self.is_subscriber(chat_id),
         )
 
     async def set_date_range(self, chat_id: int, date_from: date | None, date_to: date | None) -> None:
-        """Свой период поездки. None, None — снова искать на ближайшие дни (days_ahead)."""
+        """Даты поездки. None, None — удалить поездку."""
         await self._ensure_settings(chat_id)
         await self._conn.execute(
             "UPDATE user_settings SET date_from = ?, date_to = ? WHERE chat_id = ?",

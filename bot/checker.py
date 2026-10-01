@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from html import escape
 from statistics import median
@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 class Deal:
     ticket: Ticket
     baseline: int | None
+    trip: bool = False  # найден по поездке пользователя, а не по ближайшим дням
 
     @property
     def discount(self) -> int | None:
@@ -85,53 +86,67 @@ class Checker:
             await asyncio.sleep(self.config.check_interval_minutes * 60)
 
     async def find_deals(self, user: UserSettings) -> list[Deal]:
-        """Горящие билеты по настройкам пользователя."""
-        tickets = self._candidates(user, await self._fetch_tickets([user]))
-        baselines = await self._baselines([(user, tickets)], BASELINE_FETCHES_PER_MANUAL_CHECK)
-        return self._evaluate(user, tickets, baselines)
+        """Горящие билеты по настройкам пользователя: на ближайшие дни и на поездку."""
+        views = _views(user)
+        tickets = await self._fetch_tickets(views)
+        candidates = [(v, self._candidates(v, tickets)) for v in views]
+        baselines = await self._baselines(candidates, BASELINE_FETCHES_PER_MANUAL_CHECK)
+        return _merge(self._evaluate(v, ts, baselines) for v, ts in candidates)
 
     async def cheapest_on_routes(self, user: UserSettings) -> list[Deal]:
         """Самый дешёвый билет по каждому маршруту пользователя, даже если он не горящий."""
-        best: dict[tuple[str, str], Ticket] = {}
-        for t in self._candidates(user, await self._fetch_tickets([user]), price_cap=False):
-            route = (t.origin, t.destination)
-            if route not in best or t.price < best[route].price:
-                best[route] = t
-        tickets = list(best.values())
-        baselines = await self._baselines([(user, tickets)], BASELINE_FETCHES_PER_MANUAL_CHECK)
-        return [Deal(t, baselines.get(_route(user, t))) for t in tickets]
+        views = _views(user)
+        tickets = await self._fetch_tickets(views)
+        candidates = []
+        for view in views:
+            best: dict[tuple[str, str], Ticket] = {}
+            for t in self._candidates(view, tickets, price_cap=False):
+                route = (t.origin, t.destination)
+                if route not in best or t.price < best[route].price:
+                    best[route] = t
+            candidates.append((view, list(best.values())))
+        baselines = await self._baselines(candidates, BASELINE_FETCHES_PER_MANUAL_CHECK)
+        return _merge(
+            [Deal(t, baselines.get(_route(v, t)), trip=v.has_range) for t in ts] for v, ts in candidates
+        )
 
     async def check_and_notify(self) -> None:
         users = [await self._db.settings(chat_id) for chat_id in await self._db.subscribers()]
         if not users:
             return
 
+        views = {u.chat_id: _views(u) for u in users}
+        all_views = [v for vs in views.values() for v in vs]
         background = asyncio.Semaphore(BACKGROUND_CONCURRENCY)
-        tickets = await self._fetch_tickets(users, background)
+        tickets = await self._fetch_tickets(all_views, background)
         by_origin: dict[str, list[Ticket]] = defaultdict(list)
         for t in tickets:
             by_origin[t.origin].append(t)
-        candidates = [(u, self._candidates(u, [t for o in u.origins for t in by_origin[o]])) for u in users]
-        baselines = await self._baselines(candidates, BASELINE_FETCHES_PER_CHECK, background)
+        candidates = {
+            id(v): (v, self._candidates(v, [t for o in v.origins for t in by_origin[o]])) for v in all_views
+        }
+        baselines = await self._baselines(list(candidates.values()), BASELINE_FETCHES_PER_CHECK, background)
         log.info("Получено билетов: %d, известно обычных цен: %d", len(tickets), len(baselines))
 
-        for user, user_tickets in candidates:
+        for user in users:
+            deals = _merge(self._evaluate(*candidates[id(v)], baselines) for v in views[user.chat_id])
             new = [
                 d
-                for d in self._evaluate(user, user_tickets, baselines)
+                for d in deals
                 if await self._db.is_new_or_cheaper(user.chat_id, d.ticket.key, d.ticket.price, RENOTIFY_DROP_PERCENT)
             ][:MAX_DEALS_PER_MESSAGE]
             if not new:
                 continue
             # Все новые билеты — одним сообщением, чтобы не упираться в лимиты Telegram
-            if await self._send(user.chat_id, format_deals(new, self.tp)):
+            if await self._send(user.chat_id, format_deals(new, self.tp, trip_label=trip_label(user))):
                 for d in new:
                     await self._db.mark_sent(user.chat_id, d.ticket.key, d.ticket.price)
                 log.info("Пользователю %s отправлено билетов: %d", user.chat_id, len(new))
             await asyncio.sleep(0.05)  # Telegram разрешает ~30 сообщений в секунду
 
     async def _fetch_tickets(self, users: list[UserSettings], limit: asyncio.Semaphore | None = None) -> list[Ticket]:
-        """Билеты, нужные всем переданным пользователям, — без повторных запросов по одному маршруту."""
+        """Билеты, нужные всем переданным пользователям (их отслеживаниям, см. _views), —
+        без повторных запросов по одному маршруту."""
         if not self.config.tp_token:
             raise RuntimeError("TRAVELPAYOUTS_TOKEN не задан в .env")
 
@@ -186,7 +201,7 @@ class Checker:
                 # Нет данных об обычной цене — ориентируемся только на потолок цены
                 hot = bool(user.max_price)
             if hot:
-                deals.append(Deal(t, baseline))
+                deals.append(Deal(t, baseline, trip=user.has_range))
         return sorted(deals, key=lambda d: (-(d.discount or 0), d.ticket.price))
 
     async def _baselines(
@@ -269,6 +284,28 @@ def _route(user: UserSettings, t: Ticket) -> _Route:
     return _Route(t.origin, t.destination, today(), today() + timedelta(days=BASELINE_DAYS), "")
 
 
+def _views(user: UserSettings) -> list[UserSettings]:
+    """Отслеживания пользователя, которые работают одновременно: поездка (свои даты) и ближайшие дни.
+
+    Каждое — копия настроек: у поездки задан date_from/date_to, у ближайших дней — нет.
+    Поездка идёт первой: если билет подходит под оба, он считается найденным по поездке.
+    """
+    views = [user] if user.has_range else []
+    if user.days_ahead >= 0:
+        views.append(replace(user, date_from=None, date_to=None))
+    return views
+
+
+def _merge(deal_lists) -> list[Deal]:
+    """Объединяет билеты разных отслеживаний без повторов, самые выгодные — первыми."""
+    seen, deals = set(), []
+    for deal in (d for ds in deal_lists for d in ds):
+        if deal.ticket.key not in seen:
+            seen.add(deal.ticket.key)
+            deals.append(deal)
+    return sorted(deals, key=lambda d: (-(d.discount or 0), d.ticket.price))
+
+
 def _search_dates(user: UserSettings) -> tuple[date, date]:
     """Первый и последний день вылета, которые интересны пользователю."""
     if user.has_range:
@@ -323,5 +360,24 @@ def rub(amount: int) -> str:
     return f"{amount:,} ₽".replace(",", " ")
 
 
-def format_deals(deals: list[Deal], tp: TravelpayoutsClient, hot: bool = True) -> str:
-    return "\n\n".join(format_deal(d, tp, hot) for d in deals)
+def format_deals(deals: list[Deal], tp: TravelpayoutsClient, hot: bool = True, trip_label: str = "") -> str:
+    """Билеты одним сообщением. Если есть билеты на поездку, они идут отдельным разделом с заголовком."""
+    nearby = [d for d in deals if not d.trip]
+    trip = [d for d in deals if d.trip]
+    if not trip:
+        return "\n\n".join(format_deal(d, tp, hot) for d in nearby)
+    sections = []
+    if nearby:
+        sections.append("⏱ <b>Ближайшие дни</b>\n\n" + "\n\n".join(format_deal(d, tp, hot) for d in nearby))
+    title = f"📆 <b>Ваша поездка {trip_label}</b>" if trip_label else "📆 <b>Ваша поездка</b>"
+    sections.append(title + "\n\n" + "\n\n".join(format_deal(d, tp, hot) for d in trip))
+    return "\n\n\n".join(sections)
+
+
+def trip_label(user: UserSettings) -> str:
+    """«28.12–08.01» или «30.12» для поездки пользователя."""
+    if not user.has_range:
+        return ""
+    if user.date_from == user.date_to:
+        return f"{user.date_from:%d.%m}"
+    return f"{user.date_from:%d.%m}–{user.date_to:%d.%m}"
