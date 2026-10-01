@@ -1,0 +1,6 @@
+aiogram>=3.13,<4
+aiohttp>=3.10
+aiosqlite>=0.20
+python-dotenv>=1.0
+# Справочник часовых поясов: в slim-образах Docker системного может не быть
+tzdata
